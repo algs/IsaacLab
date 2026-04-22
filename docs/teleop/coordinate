@@ -1,0 +1,299 @@
+#!/bin/sh
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+# Parameters:
+# - CONTAINER_NAME: The name of the container for coordination
+# - COORDINATION_DIR: The directory for coordination between containers
+# - CONTAINER_BIRTH_DEPS: Space-separated list of containers that must start before this one
+# - CONTAINER_DEATH_DEPS: Space-separated list of containers that, when any exits, this one should exit too if AUTO_RESTART is not set to "true"
+# - CONTAINER_AUTO_RESTART: If set to "true", the container will restart its child process if it exits
+
+set -e
+
+SHARED_DIR="${COORDINATION_DIR:-/coordination-shared}"
+
+if [ -z "${CONTAINER_NAME}" ]; then
+  echo "err: env CONTAINER_NAME not defined"
+  exit 1
+elif [ ! -d "${SHARED_DIR}" ]; then
+  echo "err: ${SHARED_DIR} is not mounted as a folder"
+  exit 1
+elif [ "${#}" -eq 0 ]; then
+  echo "nothing to coordinate"
+  exit 1
+fi
+
+# Internal variables
+COORDINATOR_PID=$$
+CHILD_PID=
+DEATH_WATCHER_PID=
+BIRTH_WATCHER_PID=
+AUTO_RESTART="${CONTAINER_AUTO_RESTART:-false}"
+
+# Writes the status of the container to the shared directory with sequence number
+write_status() {
+  local status="$1"
+  
+  # Get the next sequence number from persistent file
+  local sequence_file="${SHARED_DIR}/${CONTAINER_NAME}.sequence"
+  local sequence="1"
+  
+  if [ -f "${sequence_file}" ]; then
+    sequence=$(($(cat "${sequence_file}") + 1))
+  fi
+  
+  # Write status with sequence number atomically
+  local status_file="${SHARED_DIR}/${CONTAINER_NAME}"
+  local temp_file="${status_file}.tmp"
+  echo "${status}:${sequence}" > "${temp_file}"
+  mv "${temp_file}" "${status_file}"
+  
+  # Update the sequence file atomically
+  local temp_sequence_file="${sequence_file}.tmp"
+  echo "${sequence}" > "${temp_sequence_file}"
+  mv "${temp_sequence_file}" "${sequence_file}"
+}
+
+# Reads the full status (status:sequence)
+read_full_status() {
+  local container="$1"
+  if [ -f "${SHARED_DIR}/${container}" ]; then
+    cat "${SHARED_DIR}/${container}"
+  else
+    echo ""
+  fi
+}
+
+# Parses status components
+parse_status() {
+  local full_status="$1"
+  local component="$2"  # "status" or "sequence"
+  
+  case "$component" in
+    "status")
+      echo "${full_status%%:*}"
+      ;;
+    "sequence")
+      echo "${full_status##*:}"
+      ;;
+  esac
+}
+
+
+
+# Checks if a dependency has been fulfilled with transition detection
+is_fulfilled() {
+  local dep="$1"
+  local event="$2"
+  local full_status=$(read_full_status "${dep}")
+  
+  if [ -z "${full_status}" ]; then
+    echo "no"
+    return
+  fi
+  
+  local current_status=$(parse_status "${full_status}" "status")
+  local current_sequence=$(parse_status "${full_status}" "sequence")
+  
+  # Check if the status matches the expected event
+  if [ "${current_status}" = "${event}" ]; then
+    # Store the last seen sequence number for this dependency
+    local last_sequence_file="${SHARED_DIR}/${dep}.last_sequence"
+    local last_sequence="0"
+    
+    if [ -f "${last_sequence_file}" ]; then
+      last_sequence=$(cat "${last_sequence_file}")
+    fi
+    
+    # If we haven't seen this sequence before, or if sequence number increased (restart)
+    if [ "${current_sequence}" -gt "${last_sequence}" ]; then
+      # Update the last sequence file atomically
+      local temp_last_sequence_file="${last_sequence_file}.tmp"
+      echo "${current_sequence}" > "${temp_last_sequence_file}"
+      mv "${temp_last_sequence_file}" "${last_sequence_file}"
+      echo "yes"
+    else
+      # If we've already seen this sequence, still return "yes" for initial fulfillment
+      # but don't update the sequence file
+      echo "yes"
+    fi
+  else
+    echo "no"
+  fi
+}
+
+
+
+# Enhanced wait function that detects rapid restarts
+wait_for() {
+  local deps="${1}"
+  local event="${2}"
+
+  while true; do
+    local fulfilled=yes
+    for dep in ${deps}; do
+      if [ "$(is_fulfilled "${dep}" "${event}")" = "no" ]; then
+        fulfilled=no
+        break
+      fi
+    done
+
+    if [ "${fulfilled}" = "yes" ]; then
+      break
+    fi
+
+    sleep 1
+  done
+}
+
+# Stops the coordinator processes
+stop_processes() {
+  [ -n "${BIRTH_WATCHER_PID}" ] && kill -TERM "${BIRTH_WATCHER_PID}" &>/dev/null || true
+  [ -n "${DEATH_WATCHER_PID}" ] && kill -TERM "${DEATH_WATCHER_PID}" &>/dev/null || true
+  [ -n "${CHILD_PID}" ] && kill -0 "${CHILD_PID}" 2>/dev/null && kill -TERM "${CHILD_PID}" &>/dev/null || true
+  write_status death
+}
+
+# Handles the hangup of the container
+handle_hangup() {
+  echo "got hangup, issuing TERM to child process"
+  kill -TERM "${CHILD_PID}" &>/dev/null || true
+}
+
+handle_exit() {
+  stop_processes
+  trap - EXIT
+  exit 0
+}
+
+# Watches for the death of a dependency or birth sequence updates
+watch_for_death_deps() {
+  # Store initial sequence numbers for birth dependencies
+  local initial_sequences=""
+  for dep in ${CONTAINER_DEATH_DEPS}; do
+    local full_status=$(read_full_status "${dep}")
+    if [ -n "${full_status}" ]; then
+      local status=$(parse_status "${full_status}" "status")
+      local sequence=$(parse_status "${full_status}" "sequence")
+      if [ "${status}" = "birth" ]; then
+        initial_sequences="${initial_sequences} ${dep}:${sequence}"
+      fi
+    fi
+  done
+
+  while true; do
+    # Check for death events
+    local death_fulfilled=yes
+    for dep in ${CONTAINER_DEATH_DEPS}; do
+      if [ "$(is_fulfilled "${dep}" "death")" = "yes" ]; then
+        echo "got ${dep} exited, issuing hangup to coordinator"
+        kill -HUP "${COORDINATOR_PID}"
+        return
+      fi
+    done
+
+    # Check for birth sequence updates
+    for dep in ${CONTAINER_DEATH_DEPS}; do
+      local full_status=$(read_full_status "${dep}")
+      if [ -n "${full_status}" ]; then
+        local status=$(parse_status "${full_status}" "status")
+        local current_sequence=$(parse_status "${full_status}" "sequence")
+        
+        if [ "${status}" = "birth" ]; then
+          # Find the initial sequence for this dependency
+          local initial_sequence="0"
+          local found_in_initial=false
+          for seq_info in ${initial_sequences}; do
+            local dep_name="${seq_info%%:*}"
+            if [ "${dep_name}" = "${dep}" ]; then
+              initial_sequence="${seq_info##*:}"
+              found_in_initial=true
+              break
+            fi
+          done
+          
+          # Only treat as restart if we had a previous sequence AND it increased
+          if [ "${found_in_initial}" = "true" ] && [ "${current_sequence}" -gt "${initial_sequence}" ]; then
+            echo "got ${dep} restarted (birth sequence ${current_sequence} > ${initial_sequence}), issuing hangup to coordinator"
+            kill -HUP "${COORDINATOR_PID}"
+            return
+          fi
+        fi
+      fi
+    done
+
+    sleep 1
+  done
+}
+
+# Watches for the birth of a dependency
+watch_for_birth_deps() {
+  wait_for "${CONTAINER_BIRTH_DEPS}" birth
+  echo "got ${CONTAINER_BIRTH_DEPS} started"
+}
+
+# Traps the exit of the container
+trap "handle_exit" EXIT TERM INT
+
+# Traps the hangup of the container
+trap "handle_hangup" HUP
+
+# Function to start the child process
+start_child_process() {
+  "${@}"& CHILD_PID=$!
+  echo "child process ${CHILD_PID} started"
+
+  # Check if runtime_started file exists
+  if [ "${CONTAINER_NAME}" = "streamer" ]; then
+    while [ ! -f "${XDG_RUNTIME_DIR:-/openxr/run}/runtime_started" ]; do
+      echo "Waiting for CloudXR Runtime to start..."
+      sleep 1
+    done
+    write_status birth
+  else
+    write_status birth
+  fi
+
+  wait "${CHILD_PID}" || EXIT_CODE=$?
+  echo "child process ${CHILD_PID} exited with code ${EXIT_CODE:-0}"
+}
+
+# Run the coordinated process
+run_coordinated_process() {
+    # Initialize status as starting
+    write_status "starting"
+
+    # Watches for the death of a dependency
+    if [ ! -z "${CONTAINER_DEATH_DEPS}" ]; then
+      watch_for_death_deps& DEATH_WATCHER_PID=$!
+    fi
+
+    if [ ! -z "${CONTAINER_BIRTH_DEPS}" ]; then
+      watch_for_birth_deps& BIRTH_WATCHER_PID=$!
+      wait "${BIRTH_WATCHER_PID}" || true
+    fi
+
+    # Start the child process and capture its exit code
+    start_child_process "${@}"
+    stop_processes
+}
+
+# Check if auto-restart is enabled
+if [ "${AUTO_RESTART}" = "true" ]; then
+  echo "Auto-restart is enabled for ${CONTAINER_NAME}"
+  # Run in a loop to restart the child process if it exits
+  while true; do
+    run_coordinated_process "${@}"
+    echo "child process exited, will restart"
+    sleep 1
+  done
+else
+  run_coordinated_process "${@}"
+  echo "child process exited, no restarts"
+fi
