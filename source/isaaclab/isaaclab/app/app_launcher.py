@@ -19,7 +19,7 @@ import os
 import re
 import signal
 import sys
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 with contextlib.suppress(ModuleNotFoundError):
     import isaacsim  # noqa: F401
@@ -523,7 +523,8 @@ class AppLauncher:
         # We allow livestream kwarg to supersede LIVESTREAM envvar
         if livestream_arg >= 0:
             if livestream_arg in livestream_valid_vals:
-                self._livestream = livestream_arg
+                # self._livestream = livestream_arg
+                self._livestream = cast(Literal[0, 1, 2], livestream_arg)
                 # print info that we overrode the env-var
                 print(
                     f"[INFO][AppLauncher]: Input keyword argument `livestream={livestream_arg}` has overridden"
@@ -535,7 +536,8 @@ class AppLauncher:
                     f" Expected: {livestream_valid_vals}."
                 )
         else:
-            self._livestream = livestream_env
+            # self._livestream = livestream_env
+            self._livestream = cast(Literal[0, 1, 2], livestream_env)
 
         # Set public IP address of a remote instance
         public_ip_env = os.environ.get("PUBLIC_IP", "127.0.0.1")
@@ -641,7 +643,7 @@ class AppLauncher:
         #   This is different from offscreen_render because this only affects the default viewport and
         #   not other render-products in the scene
         self._render_viewport = True
-        if self._headless and not self._livestream and not launcher_args.get("video", False):
+        if self._headless and not self._livestream and not launcher_args.get("video", False) and not self._xr:
             self._render_viewport = False
 
         # hide_ui flag
@@ -689,7 +691,8 @@ class AppLauncher:
             launcher_args["multi_gpu"] = False
             # limit CPU threads to minimize thread context switching
             # this ensures processes do not take up all available threads and fight for resources
-            num_cpu_cores = os.cpu_count()
+            # num_cpu_cores = os.cpu_count()
+            num_cpu_cores = os.cpu_count() or 1
             num_threads_per_process = num_cpu_cores // int(os.getenv("WORLD_SIZE", 1))
             # set environment variables to limit CPU threads
             os.environ["PXR_WORK_THREAD_LIMIT"] = str(num_threads_per_process)
@@ -919,15 +922,18 @@ class AppLauncher:
             return
 
         # arg checks
-        if launcher_args.get("anim_recording_start_time") >= launcher_args.get("anim_recording_stop_time"):
+        # if launcher_args.get("anim_recording_start_time") >= launcher_args.get("anim_recording_stop_time"):
+        start_time = float(launcher_args.get("anim_recording_start_time", 0.0))
+        stop_time = float(launcher_args.get("anim_recording_stop_time", 0.0))
+        if start_time >= stop_time:
             raise ValueError(
                 f"'anim_recording_start_time' {launcher_args.get('anim_recording_start_time')} must be less than"
                 f" 'anim_recording_stop_time' {launcher_args.get('anim_recording_stop_time')}"
             )
 
-        # grab config
-        start_time = launcher_args.get("anim_recording_start_time")
-        stop_time = launcher_args.get("anim_recording_stop_time")
+        # # grab config
+        # start_time = launcher_args.get("anim_recording_start_time")
+        # stop_time = launcher_args.get("anim_recording_stop_time")
 
         # store config in carb settings
         carb_settings = carb.settings.get_settings()
@@ -945,14 +951,22 @@ class AppLauncher:
     def is_isaac_sim_version_4_5(self) -> bool:
         if not hasattr(self, "_is_sim_ver_4_5"):
             # 1) Try to read the VERSION file (for manual / binary installs)
-            version_path = os.path.abspath(os.path.join(os.path.dirname(isaacsim.__file__), "../../VERSION"))
-            if os.path.isfile(version_path):
-                with open(version_path) as f:
-                    ver = f.readline().strip()
-                    if ver.startswith("4.5"):
-                        self._is_sim_ver_4_5 = True
-                        return True
-
+            # version_path = os.path.abspath(os.path.join(os.path.dirname(isaacsim.__file__), "../../VERSION"))
+            # if os.path.isfile(version_path):
+            #     with open(version_path) as f:
+            #         ver = f.readline().strip()
+            #         if ver.startswith("4.5"):
+            #             self._is_sim_ver_4_5 = True
+            #             return True
+            isaacsim_file = getattr(isaacsim, "__file__", None)
+            if isaacsim_file is not None:
+                version_path = os.path.abspath(os.path.join(os.path.dirname(isaacsim_file), "../../VERSION"))
+                if os.path.isfile(version_path):
+                    with open(version_path) as f:
+                        ver = f.readline().strip()
+                        if ver.startswith("4.5"):
+                            self._is_sim_ver_4_5 = True
+                            return True
             # 2) Fall back to metadata (for pip installs)
             from importlib.metadata import version as pkg_version
 
