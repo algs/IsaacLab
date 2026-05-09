@@ -26,6 +26,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import CameraCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
@@ -86,7 +87,9 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
                 "left_wrist_roll_joint": 0.0,
                 "left_wrist_pitch_joint": 0.0,
                 # --
-                "head_.*": 0.0,
+                "head_roll_joint": 0.0,
+                "head_pitch_joint": 0.7030,
+                "head_yaw_joint": 0.0,
                 "waist_.*": 0.0,
                 ".*_hip_.*": 0.0,
                 ".*_knee_.*": 0.0,
@@ -97,7 +100,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
             joint_vel={".*": 0.0},
         ),
     )
-
+   
     # Ground plane
     ground = AssetBaseCfg(
         prim_path="/World/GroundPlane",
@@ -417,4 +420,30 @@ class PickPlaceGR1T2EnvCfg(ManagerBasedRLEnvCfg):
                     xr_cfg=self.xr,
                 ),
             }
+        )
+
+@configclass
+class PickPlaceGR1T2CameraEnvCfg(PickPlaceGR1T2EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.table_cam = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/head_yaw_link/Camera",
+            update_period=0.0,
+            height=480,
+            width=640,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=12.4, focus_distance=400, horizontal_aperture=56.9, clipping_range=(0.1, 5.0)
+            ),
+            offset=CameraCfg.OffsetCfg(
+                pos=(0.13, 0.0, 0.06),
+                rot=(0.627211, 0.326506, -0.326506, -0.627211),
+                convention="opengl",
+            ),
+        )
+
+        self.observations.policy.table_cam = ObsTerm(
+            func=mdp.image,
+            params={"sensor_cfg": SceneEntityCfg("table_cam"), "data_type": "rgb", "normalize": False},
         )
